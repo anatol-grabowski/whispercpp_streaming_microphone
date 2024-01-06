@@ -42,6 +42,47 @@ class ASRBase:
         raise NotImplemented("must be implemented in the child class")
 
 
+class WhispercppASR(ASRBase):
+    sep = ""  # character used to join tokens, empty string because whisper tokens have necessary spaces already
+
+    def load_model(self, modelsize=None, cache_dir=None, model_dir=None):
+        ''' can return any value, returned value is saved as self.model '''
+        from whispercpp import Whisper
+        whisp = Whisper.from_pretrained(
+            'small', basedir='/home/anatoly/_tot/proj/web/chatgpt-free-api/models/')
+        whisp.params.token_timestamps = True
+        whisp.params.language = self.original_language
+        return whisp
+
+    def transcribe(self, audio, init_prompt=""):
+        ''' can return any value, returned value is the input for ts_words and segments_end_ts '''
+        whisp = self.model
+        whisp.transcribe(audio)
+        segments = []
+        for i in range(whisp.context.full_n_segments()):
+            tokens = []
+            for j in range(whisp.context.full_n_tokens(i)):
+                text = whisp.context.full_get_token_text(i, j)
+                # if text[0] == '[': continue
+                token_data = whisp.context.full_get_token_data(i, j)
+                token = (token_data.t0, token_data.t1, text)
+                tokens.append(token)
+            # if len(tokens) == 0: continue
+            start = whisp.context.full_get_segment_start(i)
+            end = whisp.context.full_get_segment_end(i)
+            segment = (start, end, tokens)
+            segments.append(segment)
+        return segments
+
+    def ts_words(self, segments):
+        ''' expected return value is the array of (t0, t1, word) tuples '''
+        return [token for start, end, tokens in segments for token in tokens]
+
+    def segments_end_ts(self, segments):
+        ''' expected return value is the array of segment end timestamps '''
+        return [end for start, end, tokens in segments]
+
+
 ## requires imports:
 #      import whisper
 #      import whisper_timestamped
@@ -433,7 +474,11 @@ def create_tokenizer(lan):
     # supported by fast-mosestokenizer
     if lan in "as bn ca cs de el en es et fi fr ga gu hi hu is it kn lt lv ml mni mr nl or pa pl pt ro ru sk sl sv ta te yue zh".split():
         from mosestokenizer import MosesTokenizer
-        return MosesTokenizer(lan)
+        tokenizer = MosesTokenizer(lan)
+        class T:
+            def split(self, text):
+                tokenizer(text)
+        return T()
 
     # the following languages are in Whisper, but not in wtpsplit:
     if lan in "as ba bo br bs fo haw hr ht jw lb ln lo mi nn oc sa sd sn so su sw tk tl tt".split():
@@ -465,7 +510,7 @@ if __name__ == "__main__":
     parser.add_argument('--lan', '--language', type=str, default='en', help="Language code for transcription, e.g. en,de,cs.")
     parser.add_argument('--task', type=str, default='transcribe', choices=["transcribe","translate"],help="Transcribe or translate.")
     parser.add_argument('--start_at', type=float, default=0.0, help='Start processing audio at this time.')
-    parser.add_argument('--backend', type=str, default="faster-whisper", choices=["faster-whisper", "whisper_timestamped"],help='Load only this backend for Whisper processing.')
+    parser.add_argument('--backend', type=str, default="faster-whisper", choices=["faster-whisper", "whisper_timestamped", "whispercpp"],help='Load only this backend for Whisper processing.')
     parser.add_argument('--offline', action="store_true", default=False, help='Offline mode.')
     parser.add_argument('--comp_unaware', action="store_true", default=False, help='Computationally unaware simulation.')
     parser.add_argument('--vad', action="store_true", default=False, help='Use VAD = voice activity detection, with the default parameters.')
@@ -491,6 +536,8 @@ if __name__ == "__main__":
     if args.backend == "faster-whisper":
         from faster_whisper import WhisperModel
         asr_cls = FasterWhisperASR
+    elif args.backend == 'whispercpp':
+        asr_cls = WhispercppASR
     else:
         import whisper
         import whisper_timestamped
