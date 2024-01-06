@@ -63,11 +63,11 @@ class WhispercppASR(ASRBase):
             tokens = []
             for j in range(whisp.context.full_n_tokens(i)):
                 text = whisp.context.full_get_token_text(i, j)
-                # if text[0] == '[': continue
+                if text[0] == '[': continue
                 token_data = whisp.context.full_get_token_data(i, j)
                 token = (token_data.t0, token_data.t1, text)
                 tokens.append(token)
-            # if len(tokens) == 0: continue
+            if len(tokens) == 0: continue
             start = whisp.context.full_get_segment_start(i)
             end = whisp.context.full_get_segment_end(i)
             segment = (start, end, tokens)
@@ -495,6 +495,57 @@ def create_tokenizer(lan):
 
 
 
+import numpy as np
+
+
+def normalize_samples(samples):
+    '''
+    Normalize int16 samples to [-1, 1] range (float32).
+    Suitable for whispercpp input.
+    '''
+    normalized = samples.astype(np.float32) / np.iinfo(samples.dtype).max
+    return normalized
+
+
+def dt_to_nsamples(dt, samplerate):
+    return int(samplerate * dt)
+
+
+def nsamples_to_dt(nsamples, samplerate):
+    ''' return seconds '''
+    return nsamples / samplerate
+
+
+class AudioChunker:
+    def __init__(self, duration=60, samplerate=16000, channels=1, dtype=np.int16):
+        bufflen = int(samplerate * duration)
+        shape = (bufflen, channels)
+        buff = np.zeros(shape, dtype=dtype)
+        self.buff = buff
+        self.samplerate = samplerate
+        self.channels = channels
+        self.duration = duration
+        self.dtype = dtype
+        self.num_unflushed = 0
+        self.tEnd = None
+
+    def add_samples(self, indata, tStart):
+        samplerate = self.samplerate
+        numsamples = indata.shape[0]
+        self.buff = np.roll(self.buff, -numsamples)
+        self.buff[-numsamples:] = indata
+        self.num_unflushed += numsamples
+        self.tEnd = tStart + nsamples_to_dt(numsamples, samplerate)
+
+    def get_unflushed(self, min_seconds=1):
+        seconds_unflushed = nsamples_to_dt(self.num_unflushed, self.samplerate)
+        if seconds_unflushed < min_seconds:
+            return None
+        samples = self.buff[-self.num_unflushed:]
+        self.num_unflushed = 0
+        norm_samples = normalize_samples(samples)
+        return norm_samples
+
 
 ## main:
 
@@ -513,6 +564,7 @@ if __name__ == "__main__":
     parser.add_argument('--backend', type=str, default="faster-whisper", choices=["faster-whisper", "whisper_timestamped", "whispercpp"],help='Load only this backend for Whisper processing.')
     parser.add_argument('--offline', action="store_true", default=False, help='Offline mode.')
     parser.add_argument('--comp_unaware', action="store_true", default=False, help='Computationally unaware simulation.')
+    parser.add_argument('--mic', action="store_true", default=False, help='Microphone input.')
     parser.add_argument('--vad', action="store_true", default=False, help='Use VAD = voice activity detection, with the default parameters.')
     args = parser.parse_args()
 
@@ -620,6 +672,34 @@ if __name__ == "__main__":
             if end >= duration:
                 break
         now = duration
+    
+    elif args.mic: # microphone input
+        import sounddevice as sd
+        chunker = AudioChunker()
+        
+        def audio_cb(indata, frames, times, status):
+            chunker.add_samples(indata, times.inputBufferAdcTime)
+            a = chunker.get_unflushed(min_chunk)
+            if a is None: 
+                return
+
+            end = chunker.tEnd
+            online.insert_audio_chunk(a)
+            try:
+                o = online.process_iter()
+            except AssertionError:
+                print("assertion error",file=sys.stderr)
+                pass
+            else:
+                output_transcript(o, now=end)
+
+            print(f"## last processed {end:.2f}s",file=sys.stderr,flush=True)
+
+        stream = sd.InputStream(samplerate=chunker.samplerate, channels=chunker.channels, dtype=chunker.buff.dtype, callback=audio_cb)
+        stream.start()
+        sd.sleep(60 * chunker.samplerate)
+        stream.stop()
+        stream.close()
 
     else: # online = simultaneous mode
         end = 0
